@@ -4,10 +4,10 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
-#define SERVER_IP   "93.184.216.34"  // exemplo.com
-#define SERVER_PORT 80
-#define MESSAGE     "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
-#define ITERATIONS  100
+#define SERVER_IP     "127.0.0.1"
+#define SERVER_PORT   8000
+#define REQUEST       "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+#define ITERATIONS    100
 
 int main(void) {
     int sockfd, i;
@@ -33,10 +33,18 @@ int main(void) {
             close(sockfd);
             return EXIT_FAILURE;
         }
-        send(sockfd, MESSAGE, strlen(MESSAGE), 0);
-        recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+        if (send(sockfd, REQUEST, strlen(REQUEST), 0) < 0) {
+            perror("send");
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
+        int n = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+        if (n > 0) {
+            buffer[n] = '\0';
+            printf("Resposta %d:\n%s\n", i+1, buffer);
+        }
         close(sockfd);
-        usleep(50000);  // aguarda 50 ms antes de nova iteração
+        usleep(50000);  // 50 ms
     }
     return EXIT_SUCCESS;
 }

@@ -185,47 +185,42 @@ static int net_monitor_thread(void *data)
     struct files_struct *files;
     struct fdtable *fdt;
     int i;
-    u64  total_sent = 0;
-    u64  total_received = 0;
+    u64 total_sent = 0;
+    u64 total_received = 0;
+    u64 local_sent, local_received;
 
-    /* Tenta buscar a task correspondente ao PID */
+    /* Busca a task correspondente ao PID */
     rcu_read_lock();
     task = pid_task(find_vpid(entry->pid), PIDTYPE_PID);
     if (!task || task->exit_state == EXIT_ZOMBIE || task->exit_state == EXIT_DEAD) {
         rcu_read_unlock();
-        /* Se o processo não existe mais ou já é zumbi, simplesmente encerra a thread */
-        goto out;
+        goto update_and_print;
     }
 
-    /* Atualiza eventuais mudanças de namespace de rede */
-    if (entry->net_ns != task->nsproxy->net_ns) {
+    /* Atualiza namespace de rede se houver mudança */
+    if (entry->net_ns != task->nsproxy->net_ns)
         entry->net_ns = task->nsproxy->net_ns;
-    }
 
-    /* Obtém a tabela de descriptors de arquivo para examinar sockets */
+    /* Obtém tabela de file descriptors */
     files = rcu_dereference(task->files);
     if (!files) {
         rcu_read_unlock();
-        goto out;
+        goto update_and_print;
     }
 
     fdt = files_fdtable(files);
     if (!fdt) {
         rcu_read_unlock();
-        goto out;
+        goto update_and_print;
     }
 
-
-
-    /* Itera sobre todos os descritores de arquivo abertos pelo processo */
+    /* Itera sobre todos os descritores para somar estatísticas de rede */
     for (i = 0; i < fdt->max_fds; i++) {
         struct file *f = rcu_dereference(fdt->fd[i]);
         struct socket *sock;
         struct sock *sk;
 
-        if (!f)
-            continue;
-        if (!S_ISSOCK(file_inode(f)->i_mode))
+        if (!f || !S_ISSOCK(file_inode(f)->i_mode))
             continue;
 
         sock = f->private_data;
@@ -236,33 +231,33 @@ static int net_monitor_thread(void *data)
         if (!sk)
             continue;
 
-        /* Apenas IPv4/IPv6, somando bytes de TCP e estatísticas de fila de UDP */
-        if (sk->sk_family == AF_INET) {
-            if (sk->sk_protocol == IPPROTO_TCP) {
-                struct tcp_sock *tp = tcp_sk(sk);
-                total_received += tp->bytes_received;
-                total_sent     += tp->bytes_acked;
-            } else if (sk->sk_protocol == IPPROTO_UDP) {
-                entry->bytes_received += atomic_read(&sk->sk_rmem_alloc);
-            }
-        } else if (sk->sk_family == AF_INET6) {
-            /* Se necessário, adaptar para IPv6 (ex.: ipv6_sk(sk)->...) */
+        /* IPv4 e IPv6: TCP e UDP */
+        if (sk->sk_protocol == IPPROTO_TCP) {
+            struct tcp_sock *tp = tcp_sk(sk);
+            total_received += tp->bytes_received;
+            total_sent     += tp->bytes_acked;
+        } else if (sk->sk_protocol == IPPROTO_UDP) {
+            total_received += atomic_read(&sk->sk_rmem_alloc);
         }
     }
     rcu_read_unlock();
 
-    /* Imprime ou salva as estatísticas de rede para este PID */
-    pr_info("Network monitor (thread): PID %d -> sent=%llu recv=%llu\n",
-            entry->pid, entry->bytes_sent, entry->bytes_received);
-
-out:
-    /* Antes de sair, limpa o ponteiro para indicar que não há thread ativa */
+update_and_print:
+    /* Atualiza counters compartilhados sob lock e captura para impressão */
     spin_lock(&table_lock);
-    entry->bytes_sent     = total_sent;
-    entry->bytes_received = total_received;
+    entry->bytes_sent     += total_sent;
+    entry->bytes_received += total_received;
+    local_sent    = entry->bytes_sent;
+    local_received = entry->bytes_received;
     spin_unlock(&table_lock);
+
+    /* Imprime valores atualizados */
+    pr_info("Network monitor (thread): PID %d -> sent=%llu recv=%llu\n",
+            entry->pid, local_sent, local_received);
+
     return 0;
 }
+
 
 
 static void net_create_workhandler(struct work_struct *work)
@@ -316,8 +311,7 @@ static void monitor_func(struct work_struct *work)
         int score = avaliar_processo(task);
         const char *nivel = classify_risk(score);
 
-        pr_info("PID: %d | Nome: %s | Score: %d | Risco: %s\n",
-                task->pid, task->comm, score, nivel);
+        //pr_info("PID: %d | Nome: %s | Score: %d | Risco: %s\n",task->pid, task->comm, score, nivel);
 
         if (__kuid_val(task->cred->uid) != 0) {
             ler_io_info(task->pid);
@@ -403,7 +397,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
     if (!found) {
         /* Se não encontrou, tenta inserir, mas antes checa se há espaço */
         if (current_count >= MAX_SYSCALLS) {
-            pr_warn("proc_sec_monitor: tabela cheia; não é possível adicionar PID %d\n", pid);
+            //pr_warn("proc_sec_monitor: tabela cheia; não é possível adicionar PID %d\n", pid);
             /* Simplesmente retorna sem inserir */
             spin_unlock(&table_lock);
             return 0;
@@ -413,7 +407,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
         entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
         
         if (!entry) {
-            pr_err("proc_sec_monitor: falha ao alocar memória para PID %d\n", pid);
+            //pr_err("proc_sec_monitor: falha ao alocar memória para PID %d\n", pid);
             spin_unlock(&table_lock);
             return 0;
         }
@@ -427,15 +421,13 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
         current_count++;
         
         
-        pr_info("proc_sec_monitor: inserido PID %d (syscall %s)\n",
-                pid, p->symbol_name);
+        //pr_info("proc_sec_monitor: inserido PID %d (syscall %s)\n",pid, p->symbol_name);
     }
     else {
         /* Se já existe, incrementa a contagem de syscalls */
         entry->syscall_count++;
       
-        pr_info("proc_sec_monitor: PID %d já existe; contagem de syscalls: %lu\n",
-                pid, entry->syscall_count);
+        //pr_info("proc_sec_monitor: PID %d já existe; contagem de syscalls: %lu\n",pid, entry->syscall_count);
     }
 
         /* 4) Se a syscall atual é de rede e não há thread ativa, cria uma nova thread */

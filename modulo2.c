@@ -123,28 +123,57 @@ static ssize_t pd_read(struct file *file, char __user *ubuf,
 
 static void cleanup_all_entries(void)
 {
-    int bkt;
+    int bkt, i, cnt = 0;
     struct proc_data *entry;
     struct hlist_node *tmp;
-    char name[16];
+    struct proc_data **to_remove;
     unsigned long flags;
+    char name[16];
 
+
+
+    /* 1) Reserve um array para coletar os ponteiros sem usar a pilha */
     spin_lock_irqsave(&table_lock, flags);
+    if (current_count > MAX_SYSCALLS)
+        cnt = MAX_SYSCALLS;
+    else
+        cnt = current_count;
+    spin_unlock_irqrestore(&table_lock, flags);
+
+    to_remove = kmalloc_array(cnt, sizeof(*to_remove), GFP_KERNEL);
+    if (!to_remove)
+        return;
+
+    /* 2) Sob lock, retire da hash e armazene em to_remove[] */
+    spin_lock_irqsave(&table_lock, flags);
+    cnt = 0;
     hash_for_each_safe(proc_table, bkt, tmp, entry, hash_node) {
-        snprintf(name, sizeof(name), "%d", entry->pid);
-        remove_proc_entry(name, proc_entry);
         hash_del(&entry->hash_node);
-        kfree(entry);
+        to_remove[cnt++] = entry;
+        current_count--;
     }
     spin_unlock_irqrestore(&table_lock, flags);
 
-    /* Por fim remove o diretório raiz /proc/avaliador */
+    /* 3) Agora, fora do lock, remova o arquivo em procfs e libere cada struct */
+    pr_alert("Aqui");
+    for (i = 0; i < cnt; i++) {
+        entry = to_remove[i];
+        snprintf(name, sizeof(name), "%d", entry->pid);
+        remove_proc_entry(name, proc_entry);  /* pode dormir */
+        cancel_work_sync(&entry->net_work);    /* garante que não haja work pendente */
+        kfree(entry);
+    }
+
+    kfree(to_remove);
+
+    /* 4) Finalmente remova o diretório raiz */
     remove_proc_entry("avaliador", NULL);
 }
 
+
 struct proc_data* hash_add_entry(pid_t pid){
 
-    char name[16];
+ 
     /* Adiciona uma nova entrada na tabela hash */
     struct proc_data *entry;
     /* Protege leitura/inserção concorrente */
@@ -162,9 +191,10 @@ struct proc_data* hash_add_entry(pid_t pid){
         spin_unlock(&table_lock);
         return entry;
     }
-    spin_unlock(&table_lock);
+
+    
     /* Cria nova entrada */
-    entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+    entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
     
     if (!entry) {
         //pr_err("proc_sec_monitor: falha ao alocar memória para PID %d\n", pid);
@@ -176,19 +206,9 @@ struct proc_data* hash_add_entry(pid_t pid){
     entry->read_flag = false;  /* Inicialmente não “lido” */
     INIT_WORK(&entry->net_work, net_create_workhandler);
     /* monta o nome do arquivo: por exemplo “1234” ou “1234.txt” */
-    snprintf(name, sizeof(name), "%d", pid);
 
-    /* cria /proc/avaliador/<pid> — supondo que proc_entry aponte para /proc/avaliador */
-    entry->file = proc_create_data(name, 0666, proc_entry, &proc_fops, entry);
-    if (!entry->file) {
-        pr_err("Não foi possível criar /proc/avaliador/%s\n", name);
-        kfree(entry);
-        return NULL;
-    }
-    
+    entry->file = NULL; // Inicializa como NULL, será criado mais tarde
     /* Insere na hash: a chave é o PID */
-
-    spin_lock(&table_lock);
     hash_add(proc_table, &entry->hash_node, entry->pid);
     current_count++;
     spin_unlock(&table_lock);
@@ -483,18 +503,28 @@ static void monitor_func(struct work_struct *work)
             continue;
 
         entry=hash_add_entry((pid_t)task->pid);
+            
+        if(entry != NULL && entry->file == NULL){
+            char name[16];
+            snprintf(name, sizeof(name), "%d", task->pid);
+            entry->file = proc_create_data(name, 0666, proc_entry, &proc_fops, entry);
+        
+            if (!entry->file) {
+                pr_err("Não foi possível criar /proc/avaliador/%s\n", name);
+            }
+        }
+            /* Se já existe uma entrada, apenas atualiza o buffer */
+        /* cria /proc/avaliador/<pid> — supondo que proc_entry aponte para /proc/avaliador */
+
         if (__kuid_val(task->cred->uid) != 0) {
             ler_io_info(task->pid);
         }
         int score = avaliar_processo(task);
         const char *nivel = classify_risk(score);
 
-        if(verify_hash_entry(task->pid) == NULL){
-
-        }
         if (entry != NULL) {
             snprintf(entry->buf, BUF_SIZE,
-                " Score: %d |  Risco %s", score, nivel);
+                " Score: %d |  Risco %s\n", score, nivel);
         }
         
         pr_info("PID: %d | Nome: %s | Score: %d | Risco: %s\n",task->pid, task->comm, score, nivel);
@@ -509,55 +539,67 @@ static void monitor_func(struct work_struct *work)
     schedule_delayed_work(&monitor_wq, msecs_to_jiffies(5000));
 }
 
-// Declaração antecipada de get_user_str
-static int get_user_str(const char __user *user_str, char *kernel_buf, size_t len);
+
 
 
 static void cleanup_zombie_entries(void)
 {
-    int bkt;
+    int bkt, i;
     struct proc_data *entry;
     struct hlist_node *tmp;
-
-    /* 1) Coleta entradas a remover sem lock */
-    struct proc_data *to_remove[MAX_SYSCALLS];
+    struct proc_data **to_remove;
     int remove_count = 0;
+    unsigned long flags;
+    char name[16];
 
+    /* aloca array temporário fora da pilha */
+    to_remove = kmalloc_array(MAX_SYSCALLS,
+                              sizeof(*to_remove),
+                              GFP_KERNEL);
+    if (!to_remove)
+        return;
+
+    /* 1) coleta, sob RCU, as entradas que devem ser removidas */
     rcu_read_lock();
     hash_for_each_safe(proc_table, bkt, tmp, entry, hash_node) {
-        struct task_struct *task = pid_task(find_vpid(entry->pid), PIDTYPE_PID);
+        struct task_struct *task =
+            pid_task(find_vpid(entry->pid), PIDTYPE_PID);
 
-        if ((!task || task->exit_state == EXIT_ZOMBIE || task->exit_state == EXIT_DEAD)
-            && entry->read_flag) {
+        if ((!task ||
+             task->exit_state == EXIT_ZOMBIE ||
+             task->exit_state == EXIT_DEAD)
+            && entry->read_flag)
+        {
             if (remove_count < MAX_SYSCALLS)
                 to_remove[remove_count++] = entry;
         }
     }
     rcu_read_unlock();
 
-    /* 2) Remove de fato: procfs + hash + memória */
-    if (remove_count > 0) {
-        int i;
-        char name[16];
+    /* 2) para cada entry marcada, remove do procfs, da hash e libera memória */
+    for (i = 0; i < remove_count; i++) {
+        entry = to_remove[i];
 
-        spin_lock(&table_lock);
-        for (i = 0; i < remove_count; i++) {
-            entry = to_remove[i];
+        /* remove do /proc/avaliador – pode dormir */
+        snprintf(name, sizeof(name), "%d", entry->pid);
+        pr_alert("Removendo PID %d de /proc/avaliador\n", entry->pid);
+        remove_proc_entry(name, proc_entry);
+        
 
-            /* monta o nome do arquivo criado: "<pid>" */
-            snprintf(name, sizeof(name), "%d", entry->pid);
+        /* remove da hash e ajusta contador sob lock */
+        spin_lock_irqsave(&table_lock, flags);
+        hash_del(&entry->hash_node);
+        current_count--;
+        spin_unlock_irqrestore(&table_lock, flags);
 
-            /* remove o arquivo de /proc/avaliador */
-            remove_proc_entry(name, proc_entry);
-
-            /* remove da hash e libera memória */
-            hash_del(&entry->hash_node);
-            kfree(entry);
-            current_count--;
-        }
-        spin_unlock(&table_lock);
+        /* libera o próprio struct */
+        kfree(entry);
     }
+
+    /* libera o array temporário */
+    kfree(to_remove);
 }
+
 
 
 static bool is_network_syscall(const char *sname)
@@ -595,6 +637,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
     if(entry != NULL){
         entry->syscall_count++; /* Incrementa contagem de syscalls */
     }else{
+        spin_unlock(&table_lock);
         return 0;
     }
     /* 4) Se a syscall atual é de rede e não há thread ativa, cria uma nova thread */
@@ -637,7 +680,7 @@ static int __init monitor_init(void)
     }
 
     // Criar entrada /proc/modulo2
-    proc_entry = proc_create("avaliador", 0444, NULL, &proc_fops);
+    proc_entry = proc_mkdir("avaliador", NULL);
     if (!proc_entry)
     {
         pr_alert("Erro ao criar entrada /proc/modulo2\n");
@@ -685,9 +728,9 @@ static void __exit monitor_exit(void)
     }
 
     cancel_delayed_work_sync(&monitor_wq);
-    cleanup_all_entries();
     flush_workqueue(net_create_wq);
     destroy_workqueue(net_create_wq);
+    cleanup_all_entries();
     kfree(probes);
 
     pr_info("Kprobes removidos\n");

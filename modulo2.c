@@ -64,6 +64,9 @@ struct proc_data {
     bool read_flag;
     struct net *net_ns;
     struct task_struct *net_thread;
+    /* I/O */
+    unsigned int io_read_count;
+    unsigned int io_write_count;
 
     /* Um work dedicado para esse PID */
     struct work_struct net_work;
@@ -174,8 +177,69 @@ static bool is_same_net_namespace(pid_t pid)
 
 static void ler_io_info(pid_t pid)
 {
+    struct proc_data *entry;
+    struct task_struct *task;
+    struct files_struct *files;
+    struct fdtable *fdt;
+    struct file **fds;
+    int i, max_fds;
+    unsigned int count_read = 0, count_write = 0;
 
+    /* Inicia seção RCU para buscar a task */
+    rcu_read_lock();
+    task = pid_task(find_vpid(pid), PIDTYPE_PID);
+    if (!task) {
+        rcu_read_unlock();
+        pr_info("ler_io_info: processo com PID %d não encontrado.\n", pid);
+        return;
+    }
+
+    /* Protege acesso a task->files */
+    task_lock(task);
+    files = rcu_dereference(task->files);
+    if (!files) {
+        task_unlock(task);
+        rcu_read_unlock();
+        pr_info("ler_io_info: nenhum files_struct para PID %d.\n", pid);
+        return;
+    }
+
+    /* Bloqueia tabela de file descriptors */
+    spin_lock(&files->file_lock);
+    fdt = files_fdtable(files);
+    if (fdt) {
+        max_fds = fdt->max_fds;
+        fds     = fdt->fd;
+        for (i = 0; i < max_fds; i++) {
+            struct file *f = fds[i];
+            if (!f)
+                continue;
+
+            if (f->f_mode & FMODE_READ)
+                count_read++;
+            if (f->f_mode & FMODE_WRITE)
+                count_write++;
+        }
+    }
+    spin_unlock(&files->file_lock);
+
+    /* Libera lock da task e RCU */
+    task_unlock(task);
+    rcu_read_unlock();
+    spin_lock(&table_lock);
+    hash_for_each_possible(proc_table, entry, hash_node, pid) {
+        if (entry->pid == pid){
+            entry->io_read_count +=count_read;
+            entry->io_write_count +=count_write; 
+            break;
+        }
+    }
+    spin_unlock(&table_lock);
+    /* Loga resultados */
+    pr_info("ler_io_info: PID %d | arquivos abertos => leitura: %u, escrita: %u\n",
+            pid, count_read, count_write);
 }
+
 
 
 static int net_monitor_thread(void *data)

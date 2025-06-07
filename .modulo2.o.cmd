@@ -1655,5 +1655,4 @@ deps_/home/mauricio/modulo2/modulo2.o := \
 /home/mauricio/modulo2/modulo2.o: $(deps_/home/mauricio/modulo2/modulo2.o)
 
 $(deps_/home/mauricio/modulo2/modulo2.o):
-
-/home/mauricio/modulo2/modulo2.o: $(wildcard ./tools/objtool/objtool)
+                                                                       

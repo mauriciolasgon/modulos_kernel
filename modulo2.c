@@ -20,7 +20,8 @@
 #include <net/inet_sock.h>
 #include <net/tcp.h>
 
-
+//Fazer analise dos metodos de avaliacao e maneira como esta sendo verificaso algumas metricas
+// Fazer inserção de logs no proc para registrar quando um processo é avaliado
 
 #define NR_SYSCALLS (sizeof(syscall_names) / sizeof(syscall_names[0]))
 
@@ -29,6 +30,8 @@ static struct task_struct *monitor_thread;
 static struct proc_dir_entry *proc_entry;
 
 static struct delayed_work monitor_wq;
+
+#define BUF_SIZE 128 // Tamanho do buffer para armazenar dados do processo
 
 
 static const char * const syscall_names[] = {
@@ -71,6 +74,9 @@ struct proc_data {
     /* Um work dedicado para esse PID */
     struct work_struct net_work;
 
+    struct proc_dir_entry *file;
+    char buf[BUF_SIZE]; // Buffer para armazenar dados do processo
+
     struct hlist_node hash_node;
 };
 
@@ -88,7 +94,109 @@ static struct work_struct net_create_work;
 
 
 static void cleanup_zombie_entries(void);
+static struct proc_data* verify_hash_entry(pid_t pid);
+static struct proc_data* hash_add_entry(pid_t pid);
+static void net_create_workhandler(struct work_struct *work);
+static int avaliar_processo(struct task_struct *task);
 
+static void ler_io_info(pid_t pid);
+static bool is_network_syscall(const char *sname);
+static int net_monitor_thread(void *data);
+static void monitor_func(struct work_struct *work);
+static ssize_t pd_read(struct file *file, char __user *ubuf,
+                       size_t count, loff_t *ppos);
+
+static const struct proc_ops proc_fops = {
+    .proc_read  = pd_read,
+};
+
+
+static ssize_t pd_read(struct file *file, char __user *ubuf,
+                       size_t count, loff_t *ppos)
+{
+    struct proc_data *info = (struct proc_data *)pde_data(file_inode(file));
+
+    return simple_read_from_buffer(ubuf, count, ppos,
+                                   info->buf, strlen(info->buf));
+}
+
+
+static void cleanup_all_entries(void)
+{
+    int bkt;
+    struct proc_data *entry;
+    struct hlist_node *tmp;
+    char name[16];
+    unsigned long flags;
+
+    spin_lock_irqsave(&table_lock, flags);
+    hash_for_each_safe(proc_table, bkt, tmp, entry, hash_node) {
+        snprintf(name, sizeof(name), "%d", entry->pid);
+        remove_proc_entry(name, proc_entry);
+        hash_del(&entry->hash_node);
+        kfree(entry);
+    }
+    spin_unlock_irqrestore(&table_lock, flags);
+
+    /* Por fim remove o diretório raiz /proc/avaliador */
+    remove_proc_entry("avaliador", NULL);
+}
+
+struct proc_data* hash_add_entry(pid_t pid){
+
+    char name[16];
+    /* Adiciona uma nova entrada na tabela hash */
+    struct proc_data *entry;
+    /* Protege leitura/inserção concorrente */
+    spin_lock(&table_lock);
+
+    entry = verify_hash_entry(pid);
+    if (entry != NULL) {
+        //pr_warn("proc_sec_monitor: já existe uma entrada para PID %d\n", pid);
+        spin_unlock(&table_lock);
+        return entry;
+    }
+    if (current_count >= MAX_SYSCALLS) {
+        //pr_warn("proc_sec_monitor: tabela cheia; não é possível adicionar PID %d\n", pid);
+        /* Simplesmente retorna sem inserir */
+        spin_unlock(&table_lock);
+        return entry;
+    }
+    spin_unlock(&table_lock);
+    /* Cria nova entrada */
+    entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+    
+    if (!entry) {
+        //pr_err("proc_sec_monitor: falha ao alocar memória para PID %d\n", pid);
+        return NULL;
+    }
+    
+    entry->pid = pid;
+    entry->syscall_count = 0; /* Inicializa contagem de syscalls */
+    entry->read_flag = false;  /* Inicialmente não “lido” */
+    INIT_WORK(&entry->net_work, net_create_workhandler);
+    /* monta o nome do arquivo: por exemplo “1234” ou “1234.txt” */
+    snprintf(name, sizeof(name), "%d", pid);
+
+    /* cria /proc/avaliador/<pid> — supondo que proc_entry aponte para /proc/avaliador */
+    entry->file = proc_create_data(name, 0666, proc_entry, &proc_fops, entry);
+    if (!entry->file) {
+        pr_err("Não foi possível criar /proc/avaliador/%s\n", name);
+        kfree(entry);
+        return NULL;
+    }
+    
+    /* Insere na hash: a chave é o PID */
+
+    spin_lock(&table_lock);
+    hash_add(proc_table, &entry->hash_node, entry->pid);
+    current_count++;
+    spin_unlock(&table_lock);
+    
+    //pr_info("proc_sec_monitor: inserido PID %d (syscall %s)\n",pid, p->symbol_name);
+    
+    return entry;
+}
 
 static const char *classify_risk(int score)
 {
@@ -173,38 +281,7 @@ static int avaliar_processo(struct task_struct *task)
 
     return score;
 }
-static bool is_same_net_namespace(pid_t pid)
-{
-    struct file *f_self, *f_pid;
-    struct kstat stat_self, stat_pid;
-    bool same_namespace = false;
-    char path[64];
 
-    f_self = filp_open("/proc/self/net/dev", O_RDONLY, 0);
-    if (IS_ERR(f_self))
-    {
-        pr_info("Erro ao abrir /proc/self/net/dev: %ld\n", PTR_ERR(f_self));
-        return false;
-    }
-
-    snprintf(path, sizeof(path), "/proc/%d/net/dev", pid);
-    f_pid = filp_open(path, O_RDONLY, 0);
-    if (IS_ERR(f_pid))
-    {
-        filp_close(f_self, NULL);
-        return false;
-    }
-
-    if (vfs_getattr(&f_self->f_path, &stat_self, STATX_INO, 0) == 0 &&
-        vfs_getattr(&f_pid->f_path, &stat_pid, STATX_INO, 0) == 0)
-    {
-        same_namespace = (stat_self.ino == stat_pid.ino);
-    }
-
-    filp_close(f_self, NULL);
-    filp_close(f_pid, NULL);
-    return same_namespace;
-}
 
 static void ler_io_info(pid_t pid)
 {
@@ -390,9 +467,13 @@ static void net_create_workhandler(struct work_struct *work)
     spin_unlock(&table_lock);
 }
 
+
+
+
 static void monitor_func(struct work_struct *work)
 {
     struct task_struct *task;
+    struct proc_data *entry;
 
     /* Mesmo laço de monitor_func */
     for_each_process(task) {
@@ -401,14 +482,24 @@ static void monitor_func(struct work_struct *work)
         if (strstr(task->comm, "systemd") || strstr(task->comm, "dbus"))
             continue;
 
-        int score = avaliar_processo(task);
-        const char *nivel = classify_risk(score);
-
-        pr_info("PID: %d | Nome: %s | Score: %d | Risco: %s\n",task->pid, task->comm, score, nivel);
-
+        entry=hash_add_entry((pid_t)task->pid);
         if (__kuid_val(task->cred->uid) != 0) {
             ler_io_info(task->pid);
         }
+        int score = avaliar_processo(task);
+        const char *nivel = classify_risk(score);
+
+        if(verify_hash_entry(task->pid) == NULL){
+
+        }
+        if (entry != NULL) {
+            snprintf(entry->buf, BUF_SIZE,
+                " Score: %d |  Risco %s", score, nivel);
+        }
+        
+        pr_info("PID: %d | Nome: %s | Score: %d | Risco: %s\n",task->pid, task->comm, score, nivel);
+
+
     }
 
     /* Limpa entradas de zumbis */
@@ -428,8 +519,7 @@ static void cleanup_zombie_entries(void)
     struct proc_data *entry;
     struct hlist_node *tmp;
 
-    /* 1) Primeiro, percorre todos os buckets SEM lock para coletar os PIDs a remover */
-    /*    (vamos guardar ponteiros em um array temporário) */
+    /* 1) Coleta entradas a remover sem lock */
     struct proc_data *to_remove[MAX_SYSCALLS];
     int remove_count = 0;
 
@@ -437,23 +527,30 @@ static void cleanup_zombie_entries(void)
     hash_for_each_safe(proc_table, bkt, tmp, entry, hash_node) {
         struct task_struct *task = pid_task(find_vpid(entry->pid), PIDTYPE_PID);
 
-        /* Se o processo não existir mais, ou estiver zumbi e já “lido” */
-        if (!task || task->exit_state == EXIT_ZOMBIE || task->exit_state == EXIT_DEAD) {
-            if (entry->read_flag) {
-                if (remove_count < MAX_SYSCALLS) {
-                    to_remove[remove_count++] = entry;
-                }
-            }
+        if ((!task || task->exit_state == EXIT_ZOMBIE || task->exit_state == EXIT_DEAD)
+            && entry->read_flag) {
+            if (remove_count < MAX_SYSCALLS)
+                to_remove[remove_count++] = entry;
         }
     }
     rcu_read_unlock();
 
-    /* remove as entradas de fato */
+    /* 2) Remove de fato: procfs + hash + memória */
     if (remove_count > 0) {
         int i;
+        char name[16];
+
         spin_lock(&table_lock);
         for (i = 0; i < remove_count; i++) {
             entry = to_remove[i];
+
+            /* monta o nome do arquivo criado: "<pid>" */
+            snprintf(name, sizeof(name), "%d", entry->pid);
+
+            /* remove o arquivo de /proc/avaliador */
+            remove_proc_entry(name, proc_entry);
+
+            /* remove da hash e libera memória */
             hash_del(&entry->hash_node);
             kfree(entry);
             current_count--;
@@ -461,6 +558,8 @@ static void cleanup_zombie_entries(void)
         spin_unlock(&table_lock);
     }
 }
+
+
 static bool is_network_syscall(const char *sname)
 {
     return (!strcmp(sname, "__x64_sys_socket")   ||
@@ -468,62 +567,37 @@ static bool is_network_syscall(const char *sname)
             !strcmp(sname, "__x64_sys_bind")     ||
             !strcmp(sname, "__x64_sys_accept"));
 }
+
+struct proc_data* verify_hash_entry(pid_t pid){
+    struct proc_data *entry;
+        /* Verifica se já existe uma entrada para este PID */
+    hash_for_each_possible(proc_table, entry, hash_node, pid) {
+        if (entry->pid == pid) {
+            
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+
 // Kprobe handler 
 static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
     pid_t pid = current->pid;
     struct proc_data *entry;
-    bool found = false;
-    
 
     /* Protege leitura/inserção concorrente */
+
+    entry=hash_add_entry(pid);
+
     spin_lock(&table_lock);
-
-    /* Verifica se já existe uma entrada para este PID */
-    hash_for_each_possible(proc_table, entry, hash_node, pid) {
-        if (entry->pid == pid) {
-            found = true;
-            break;
-        }
+    if(entry != NULL){
+        entry->syscall_count++; /* Incrementa contagem de syscalls */
+    }else{
+        return 0;
     }
-    
-    if (!found) {
-        /* Se não encontrou, tenta inserir, mas antes checa se há espaço */
-        if (current_count >= MAX_SYSCALLS) {
-            //pr_warn("proc_sec_monitor: tabela cheia; não é possível adicionar PID %d\n", pid);
-            /* Simplesmente retorna sem inserir */
-            spin_unlock(&table_lock);
-            return 0;
-        }
-
-        /* Cria nova entrada */
-        entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
-        
-        if (!entry) {
-            //pr_err("proc_sec_monitor: falha ao alocar memória para PID %d\n", pid);
-            spin_unlock(&table_lock);
-            return 0;
-        }
-        
-        entry->pid = pid;
-        entry->syscall_count = 1; /* Inicializa contagem de syscalls */
-        entry->read_flag = false;  /* Inicialmente não “lido” */
-        INIT_WORK(&entry->net_work, net_create_workhandler);
-        /* Insere na hash: a chave é o PID */
-        hash_add(proc_table, &entry->hash_node, entry->pid);
-        current_count++;
-        
-        
-        //pr_info("proc_sec_monitor: inserido PID %d (syscall %s)\n",pid, p->symbol_name);
-    }
-    else {
-        /* Se já existe, incrementa a contagem de syscalls */
-        entry->syscall_count++;
-      
-        //pr_info("proc_sec_monitor: PID %d já existe; contagem de syscalls: %lu\n",pid, entry->syscall_count);
-    }
-
-        /* 4) Se a syscall atual é de rede e não há thread ativa, cria uma nova thread */
+    /* 4) Se a syscall atual é de rede e não há thread ativa, cria uma nova thread */
     if (is_network_syscall(p->symbol_name) && !entry->net_thread) {
         /* “Kick” o work para eventualmente criar a thread em contexto de kworker */
         queue_work(net_create_wq,  &entry->net_work);
@@ -532,60 +606,6 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-static int proc_show(struct seq_file *m, void *v)
-{
-    struct task_struct *task;
-    seq_printf(m, "=== Processos Monitorados ===\n");
-    for_each_process(task)
-    {
-        if (task->exit_state == EXIT_ZOMBIE || task->exit_state == EXIT_DEAD)
-            continue;
-        if (strstr(task->comm, "systemd") || strstr(task->comm, "dbus"))
-            continue;
-        int score = avaliar_processo(task);
-        const char *nivel = classify_risk(score);
-        seq_printf(m, "PID: %d | Nome: %s | Score: %d | Risco: %s\n",
-                   task->pid, task->comm, score, nivel);
-    }
-
-    return 0;
-}
-
-static int proc_open(struct inode *inode, struct file *file)
-{
-    return single_open(file, proc_show, NULL);
-}
-
-
-
-static const struct proc_ops proc_fops = {
-    .proc_open = proc_open,
-    .proc_read = seq_read,
-    .proc_lseek = seq_lseek,
-    .proc_release = single_release,
-};
-
-
-// Definição de get_user_str
-static int get_user_str(const char __user *user_str, char *kernel_buf, size_t len)
-{
-    long copied;
-
-    if (!user_str)
-        return -EFAULT;
-
-    // Verifica se o ponteiro é válido
-    if (!access_ok(user_str, 1))
-        return -EFAULT;
-
-    // Tenta copiar com copy_from_user
-    copied = copy_from_user(kernel_buf, user_str, len - 1);
-    if (copied == len - 1)
-        return -EFAULT;
-
-    kernel_buf[len - copied - 1] = '\0';
-    return 0;
-}
 
 static int __init monitor_init(void)
 {
@@ -617,7 +637,7 @@ static int __init monitor_init(void)
     }
 
     // Criar entrada /proc/modulo2
-    proc_entry = proc_create("modulo2", 0444, NULL, &proc_fops);
+    proc_entry = proc_create("avaliador", 0444, NULL, &proc_fops);
     if (!proc_entry)
     {
         pr_alert("Erro ao criar entrada /proc/modulo2\n");
@@ -663,8 +683,9 @@ static void __exit monitor_exit(void)
         printk(KERN_INFO "Unregistered kprobe for %s\n", probes[i].symbol_name);
         i++;
     }
-    
+
     cancel_delayed_work_sync(&monitor_wq);
+    cleanup_all_entries();
     flush_workqueue(net_create_wq);
     destroy_workqueue(net_create_wq);
     kfree(probes);

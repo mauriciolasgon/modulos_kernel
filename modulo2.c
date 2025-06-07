@@ -106,7 +106,7 @@ static int avaliar_processo(struct task_struct *task)
     pid_t pid = task->pid;
     struct proc_data *entry;
 
-    /* 1) Calcula o score normalmente */
+    /* 1) Score original */
     if (__kuid_val(task->cred->uid) == 0)
         score += 2;
     if (task->exit_state == EXIT_ZOMBIE)
@@ -125,11 +125,13 @@ static int avaliar_processo(struct task_struct *task)
     if (task->signal && task->signal->tty == NULL)
         score += 1;
 
-    if (strstr(task->comm, "backdoor") || strstr(task->comm, "nc") ||
-        strstr(task->comm, "ssh") || strstr(task->comm, "crypto"))
+    if (strstr(task->comm, "backdoor") ||
+        strstr(task->comm, "nc")      ||
+        strstr(task->comm, "ssh")     ||
+        strstr(task->comm, "crypto"))
         score += 3;
 
-    /* 2) Agora, localiza a entrada na hash e marca como “lido” */
+    /* 2) Atualiza read_flag e busca a entry na hash */
     spin_lock(&table_lock);
     hash_for_each_possible(proc_table, entry, hash_node, pid) {
         if (entry->pid == pid) {
@@ -139,9 +141,30 @@ static int avaliar_processo(struct task_struct *task)
     }
     spin_unlock(&table_lock);
 
+    if (!entry)
+        return score;
+
+    /* 3) Ajusta score com base em métricas de rede */
+    const u64 NET_HIGH = 10 * 1024 * 1024;  // 10 MB
+    const u64 NET_MED  =  1 * 1024 * 1024;  // 1 MB
+
+    if (entry->bytes_sent + entry->bytes_received > NET_HIGH)
+        score += 4;
+    else if (entry->bytes_sent + entry->bytes_received > NET_MED)
+        score += 2;
+
+    /* 4) Ajusta score com base em métricas de I/O de disco */
+    const unsigned int IO_HIGH = 1000;  // número de FDs abertos
+    const unsigned int IO_MED  =  100;
+
+    if (entry->io_read_count + entry->io_write_count > IO_HIGH)
+        score += 3;
+    else if (entry->io_read_count + entry->io_write_count > IO_MED)
+        score += 1;
+
+
     return score;
 }
-
 static bool is_same_net_namespace(pid_t pid)
 {
     struct file *f_self, *f_pid;
@@ -239,8 +262,6 @@ static void ler_io_info(pid_t pid)
     pr_info("ler_io_info: PID %d | arquivos abertos => leitura: %u, escrita: %u\n",
             pid, count_read, count_write);
 }
-
-
 
 static int net_monitor_thread(void *data)
 {
@@ -375,7 +396,7 @@ static void monitor_func(struct work_struct *work)
         int score = avaliar_processo(task);
         const char *nivel = classify_risk(score);
 
-        //pr_info("PID: %d | Nome: %s | Score: %d | Risco: %s\n",task->pid, task->comm, score, nivel);
+        pr_info("PID: %d | Nome: %s | Score: %d | Risco: %s\n",task->pid, task->comm, score, nivel);
 
         if (__kuid_val(task->cred->uid) != 0) {
             ler_io_info(task->pid);

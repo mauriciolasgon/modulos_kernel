@@ -162,6 +162,14 @@ static int avaliar_processo(struct task_struct *task)
     else if (entry->io_read_count + entry->io_write_count > IO_MED)
         score += 1;
 
+    /* 3) Avalia uso de syscalls */
+    const unsigned long SC_HIGH = 50000;   // 50 000 chamadas
+    const unsigned long SC_MED  =  5000;   // 5 000 chamadas
+
+    if (entry->syscall_count > SC_HIGH)
+        score += 3;
+    else if (entry->syscall_count > SC_MED)
+        score += 1;
 
     return score;
 }

@@ -20,10 +20,39 @@
 #include <net/inet_sock.h>
 #include <net/tcp.h>
 
-//Fazer analise dos metodos de avaliacao e maneira como esta sendo verificaso algumas metricas
-// Fazer inserção de logs no proc para registrar quando um processo é avaliado
 
 #define NR_SYSCALLS (sizeof(syscall_names) / sizeof(syscall_names[0]))
+#define BUF_SIZE 128 // Tamanho do buffer para armazenar dados do processo
+#define MAX_SYSCALLS 256 // Número máximo de syscalls que podemos monitorar
+#define HASH_entries 8 // Número de bits para a tabela hash (2^8 = 256 entradas)
+
+
+
+
+static int current_count = 0;
+
+DEFINE_HASHTABLE(proc_table, HASH_entries); // Tabela que armazena syscalls de 256 processos
+static spinlock_t table_lock;
+
+/* Funções */
+static void cleanup_zombie_entries(void);
+static struct proc_data* verify_hash_entry(pid_t pid);
+static struct proc_data* hash_add_entry(pid_t pid);
+static void net_create_workhandler(struct work_struct *work);
+static int avaliar_processo(struct task_struct *task);
+static void ler_io_info(pid_t pid);
+static bool is_network_syscall(const char *sname);
+static int net_monitor_thread(void *data);
+static void monitor_func(struct work_struct *work);
+static ssize_t pd_read(struct file *file, char __user *ubuf,
+                       size_t count, loff_t *ppos);
+struct proc_data* hash_add_entry(pid_t pid);
+static const char *classify_risk(int score);
+static int handler_pre(struct kprobe *p, struct pt_regs *regs);
+static void cleanup_all_entries(void);
+
+
+/* Structs */
 
 static struct task_struct *monitor_thread;
 
@@ -31,8 +60,33 @@ static struct proc_dir_entry *proc_entry;
 
 static struct delayed_work monitor_wq;
 
-#define BUF_SIZE 128 // Tamanho do buffer para armazenar dados do processo
+struct proc_data {
+    pid_t pid;
+    unsigned long syscall_count;
+    u64 bytes_sent;
+    u64 bytes_received;
+    bool read_flag;
+    struct net *net_ns;
+    struct task_struct *net_thread;
+    /* I/O */
+    unsigned int io_read_count;
+    unsigned int io_write_count;
 
+    /* Um work dedicado para esse PID */
+    struct work_struct net_work;
+
+    struct proc_dir_entry *file;
+    char buf[BUF_SIZE]; // Buffer para armazenar dados do processo
+
+    struct hlist_node hash_node;
+};
+static struct kprobe *probes;
+
+static struct workqueue_struct *net_create_wq;
+
+static const struct proc_ops proc_fops = {
+    .proc_read  = pd_read,
+};
 
 static const char * const syscall_names[] = {
     "__x64_sys_execve",     // execve
@@ -56,59 +110,92 @@ static const char * const syscall_names[] = {
     "__x64_sys_execveat",   // execveat
 };
 
-#define MAX_SYSCALLS 256 // Número máximo de syscalls que podemos monitorar
-#define HASH_entries 8 // Número de bits para a tabela hash (2^8 = 256 entradas)
-
-struct proc_data {
-    pid_t pid;
-    unsigned long syscall_count;
-    u64 bytes_sent;
-    u64 bytes_received;
-    bool read_flag;
-    struct net *net_ns;
-    struct task_struct *net_thread;
-    /* I/O */
-    unsigned int io_read_count;
-    unsigned int io_write_count;
-
-    /* Um work dedicado para esse PID */
-    struct work_struct net_work;
-
-    struct proc_dir_entry *file;
-    char buf[BUF_SIZE]; // Buffer para armazenar dados do processo
-
-    struct hlist_node hash_node;
-};
-
-static int current_count = 0;
-
-DEFINE_HASHTABLE(proc_table, HASH_entries); // Tabela que armazena syscalls de 256 processos
-static spinlock_t table_lock;
+static int __init monitor_init(void)
+{
+    int ret;
 
 
-static struct kprobe *probes;
+    probes = kcalloc(NR_SYSCALLS, sizeof(struct kprobe), GFP_KERNEL);
+    if (!probes) {
+        printk(KERN_ERR "proc_sec_monitor: falha ao alocar memória para kprobes\n");
+        return -ENOMEM;
+    }
 
-static struct workqueue_struct *net_create_wq;
+    // Para cada nome de syscall, configuramos o kprobe e o registramos
+    for (int i = 0; i < NR_SYSCALLS; i++) {
+        probes[i].symbol_name = syscall_names[i];    // atribui nome da syscall
+        probes[i].pre_handler  = handler_pre;        // atribui handler de pré-execução
+        ret = register_kprobe(&probes[i]);
+        if (ret < 0) {
+            printk(KERN_ERR "proc_sec_monitor: falha ao registrar kprobe para %s (erro %d)\n",
+                   syscall_names[i], ret);
+            // Em caso de erro, desfaz todos os que foram registrados até agora
+            while (--i >= 0) {
+                unregister_kprobe(&probes[i]);
+            }
+            kfree(probes);
+            return ret;
+        }
+        printk(KERN_INFO "proc_sec_monitor: registrado kprobe para %s\n", syscall_names[i]);
+    }
 
-static struct work_struct net_create_work;
+    // Criar entrada /proc/modulo2
+    proc_entry = proc_mkdir("avaliador", NULL);
+    if (!proc_entry)
+    {
+        pr_alert("Erro ao criar entrada /proc/modulo2\n");
+        int i = 0;
 
+        while (probes[i].symbol_name) {
+            unregister_kprobe(&probes[i]);
+            printk(KERN_INFO "Unregistered kprobe for %s\n", probes[i].symbol_name);
+            i++;
+        }
 
-static void cleanup_zombie_entries(void);
-static struct proc_data* verify_hash_entry(pid_t pid);
-static struct proc_data* hash_add_entry(pid_t pid);
-static void net_create_workhandler(struct work_struct *work);
-static int avaliar_processo(struct task_struct *task);
+        return -ENOMEM;
+    }
 
-static void ler_io_info(pid_t pid);
-static bool is_network_syscall(const char *sname);
-static int net_monitor_thread(void *data);
-static void monitor_func(struct work_struct *work);
-static ssize_t pd_read(struct file *file, char __user *ubuf,
-                       size_t count, loff_t *ppos);
+    // Iniciar thread de monitoramento
+    net_create_wq = alloc_workqueue("net_create_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    if (!net_create_wq) {
+        pr_err("Falha ao criar workqueue net_create_wq\n");
+        return -ENOMEM;
+    }
+    
 
-static const struct proc_ops proc_fops = {
-    .proc_read  = pd_read,
-};
+    INIT_DELAYED_WORK(&monitor_wq, monitor_func);
+
+    /* Agenda para rodar apenas uma vez após 5 segundos */
+    schedule_delayed_work(&monitor_wq, msecs_to_jiffies(5000));
+
+    return 0;
+}
+
+static void __exit monitor_exit(void)
+{
+    pr_info("Finalizando monitor de processos...\n");
+    if (monitor_thread)
+        kthread_stop(monitor_thread);
+
+    if (proc_entry)
+        proc_remove(proc_entry);
+    int i = 0;
+   
+    while (probes[i].symbol_name) {
+        unregister_kprobe(&probes[i]);
+        printk(KERN_INFO "Unregistered kprobe for %s\n", probes[i].symbol_name);
+        i++;
+    }
+
+    cancel_delayed_work_sync(&monitor_wq);
+    flush_workqueue(net_create_wq);
+    destroy_workqueue(net_create_wq);
+    cleanup_all_entries();
+    kfree(probes);
+
+    pr_info("Kprobes removidos\n");
+}
+
 
 
 static ssize_t pd_read(struct file *file, char __user *ubuf,
@@ -647,93 +734,6 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
     }
     spin_unlock(&table_lock);
     return 0;
-}
-
-
-static int __init monitor_init(void)
-{
-    int ret;
-
-
-    probes = kcalloc(NR_SYSCALLS, sizeof(struct kprobe), GFP_KERNEL);
-    if (!probes) {
-        printk(KERN_ERR "proc_sec_monitor: falha ao alocar memória para kprobes\n");
-        return -ENOMEM;
-    }
-
-    // Para cada nome de syscall, configuramos o kprobe e o registramos
-    for (int i = 0; i < NR_SYSCALLS; i++) {
-        probes[i].symbol_name = syscall_names[i];    // atribui nome da syscall
-        probes[i].pre_handler  = handler_pre;        // atribui handler de pré-execução
-        ret = register_kprobe(&probes[i]);
-        if (ret < 0) {
-            printk(KERN_ERR "proc_sec_monitor: falha ao registrar kprobe para %s (erro %d)\n",
-                   syscall_names[i], ret);
-            // Em caso de erro, desfaz todos os que foram registrados até agora
-            while (--i >= 0) {
-                unregister_kprobe(&probes[i]);
-            }
-            kfree(probes);
-            return ret;
-        }
-        printk(KERN_INFO "proc_sec_monitor: registrado kprobe para %s\n", syscall_names[i]);
-    }
-
-    // Criar entrada /proc/modulo2
-    proc_entry = proc_mkdir("avaliador", NULL);
-    if (!proc_entry)
-    {
-        pr_alert("Erro ao criar entrada /proc/modulo2\n");
-        int i = 0;
-
-        while (probes[i].symbol_name) {
-            unregister_kprobe(&probes[i]);
-            printk(KERN_INFO "Unregistered kprobe for %s\n", probes[i].symbol_name);
-            i++;
-        }
-
-        return -ENOMEM;
-    }
-
-    // Iniciar thread de monitoramento
-    net_create_wq = alloc_workqueue("net_create_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
-    if (!net_create_wq) {
-        pr_err("Falha ao criar workqueue net_create_wq\n");
-        return -ENOMEM;
-    }
-    
-
-    INIT_DELAYED_WORK(&monitor_wq, monitor_func);
-
-    /* Agenda para rodar apenas uma vez após 5 segundos */
-    schedule_delayed_work(&monitor_wq, msecs_to_jiffies(5000));
-
-    return 0;
-}
-
-static void __exit monitor_exit(void)
-{
-    pr_info("Finalizando monitor de processos...\n");
-    if (monitor_thread)
-        kthread_stop(monitor_thread);
-
-    if (proc_entry)
-        proc_remove(proc_entry);
-    int i = 0;
-   
-    while (probes[i].symbol_name) {
-        unregister_kprobe(&probes[i]);
-        printk(KERN_INFO "Unregistered kprobe for %s\n", probes[i].symbol_name);
-        i++;
-    }
-
-    cancel_delayed_work_sync(&monitor_wq);
-    flush_workqueue(net_create_wq);
-    destroy_workqueue(net_create_wq);
-    cleanup_all_entries();
-    kfree(probes);
-
-    pr_info("Kprobes removidos\n");
 }
 
 module_init(monitor_init);

@@ -1,0 +1,13 @@
+# Kernel build artifacts
+*.o
+*.ko
+*.mod.c
+*.symvers
+modules.order
+Module.symvers
+.tmp_versions/
+*.cmd
+*.d
+vmlinux
+build/
+*.mod

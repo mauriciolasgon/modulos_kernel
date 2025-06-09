@@ -31,9 +31,10 @@ make
 sudo insmod kfetch_mod.ko
 ```
 
-````bash
+```bash
 sudo dmesg | tail
+```
 
 ```bash
 sudo cat /dev/kfetch
-````
+```

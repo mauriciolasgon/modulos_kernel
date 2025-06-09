@@ -7,9 +7,9 @@ Este projeto implementa dois módulos de kernel Linux que atuam no monitoramento
 ## 📁 Estrutura do Projeto
 
 ### 🛠️ Modulo 2 - Funcionalidades
-- Análise de risco de processos com base em critérios como UID, uso de CPU, estado (zumbi), e presença de padrões suspeitos no nome.
+- Análise de risco de processos com base em critérios como UID, uso de CPU, uso de memória etc...
 - Leitura de arquivos abertos para identificar comportamento de I/O.
-- Comparação de namespaces de rede para detectar possíveis contêineres ou isolamento.
+- Avaliação da quantidade de bytes enviados e recebidos por processo.
 - Thread no kernel para varredura contínua.
 - Interface `/proc` para exibir processos monitorados e seus níveis de risco.
 

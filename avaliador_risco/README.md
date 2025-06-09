@@ -26,5 +26,5 @@ Este projeto implementa dois módulos de kernel Linux que atuam no monitoramento
    sudo insmod modulo2.ko
 
 3. Acesse a interface /proc
-  ```bash
-  sudo cat /proc/avalidador/<pid>
+   ```bash
+   sudo cat /proc/avalidador/<pid>

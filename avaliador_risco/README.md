@@ -27,4 +27,4 @@ Este projeto implementa dois módulos de kernel Linux que atuam no monitoramento
 
 3. Acesse a interface /proc
    ```bash
-   sudo cat /proc/avalidador/<pid>
+   cat /proc/avaliador/<pid>

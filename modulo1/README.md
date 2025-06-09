@@ -25,11 +25,15 @@ O `kfetch_mod` é um módulo de kernel Linux desenvolvido para exibir informaç�
 
 ```bash
 make
+```
 
+```bash
 sudo insmod kfetch_mod.ko
+```
 
+````bash
 sudo dmesg | tail
 
+```bash
 sudo cat /dev/kfetch
-
-```
+````
